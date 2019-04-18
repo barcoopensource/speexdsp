@@ -109,6 +109,12 @@ static void speex_free (void *ptr) {free(ptr);}
 #define FIXED_STACK_ALLOC 1024
 #endif
 
+#include <stdint.h>
+
+// factor for memory reallocation to prevent reallocations
+// @LUTAL
+#define MIN_ALLOCATION_SIZE 16384
+
 typedef int (*resampler_basic_func)(SpeexResamplerState *, spx_uint32_t , const spx_word16_t *, spx_uint32_t *, spx_word16_t *, spx_uint32_t *);
 
 struct SpeexResamplerState_ {
@@ -595,10 +601,21 @@ static int _muldiv(spx_uint32_t *result, spx_uint32_t value, spx_uint32_t mul, s
    spx_uint32_t major = value / div;
    spx_uint32_t remainder = value % div;
    /* TODO: Could use 64 bits operation to check for overflow. But only guaranteed in C99+ */
+   
+   /*
    if (remainder > UINT32_MAX / mul || major > UINT32_MAX / mul
        || major * mul > UINT32_MAX - remainder * mul / div)
       return RESAMPLER_ERR_OVERFLOW;
-   *result = remainder * mul / div + major * mul;
+   */
+
+   uint64_t tmp = (uint64_t)remainder * (uint64_t)mul / (uint64_t)div + (uint64_t)major * (uint64_t)mul ;
+   
+   if (tmp > UINT32_MAX)
+   {
+     return RESAMPLER_ERR_OVERFLOW;
+   }
+   *result = (spx_uint32_t)tmp;
+   //*result = remainder * mul / div + major * mul;
    return RESAMPLER_ERR_SUCCESS;
 }
 
@@ -658,6 +675,12 @@ static int update_filter(SpeexResamplerState *st)
    }
    if (st->sinc_table_length < min_sinc_table_length)
    {
+     
+      if(min_sinc_table_length < MIN_ALLOCATION_SIZE)
+      {
+        min_sinc_table_length = MIN_ALLOCATION_SIZE;
+      }     
+
       spx_word16_t *sinc_table = (spx_word16_t *)speex_realloc(st->sinc_table,min_sinc_table_length*sizeof(spx_word16_t));
       if (!sinc_table)
          goto fail;
@@ -709,6 +732,11 @@ static int update_filter(SpeexResamplerState *st)
    min_alloc_size = st->filt_len-1 + st->buffer_size;
    if (min_alloc_size > st->mem_alloc_size)
    {
+      if (min_alloc_size < MIN_ALLOCATION_SIZE)
+      {
+        min_alloc_size = MIN_ALLOCATION_SIZE;
+      }
+     
       spx_word16_t *mem;
       if (INT_MAX/sizeof(spx_word16_t)/st->nb_channels < min_alloc_size)
           goto fail;
