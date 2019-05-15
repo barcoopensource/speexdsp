@@ -9,6 +9,7 @@ Major points:
 - Better error reporting
 - Make kiss-fft 32-bit safe
 
+
 Post 1.2:
 improve float<->int conversion
 split encoder and decoder?
