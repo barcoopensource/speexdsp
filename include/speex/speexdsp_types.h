@@ -119,7 +119,12 @@
 
 #else
 
-#include "speexdsp_config_types.h"
+  typedef short spx_int16_t;
+  typedef unsigned short spx_uint16_t;
+  typedef int spx_int32_t;
+  typedef unsigned int spx_uint32_t;
+
+// #include "speexdsp_config_types.h"
 
 #endif
 
