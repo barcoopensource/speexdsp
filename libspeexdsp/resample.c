@@ -96,11 +96,14 @@ static void speex_free(void *ptr) {free(ptr);}
 #define UINT32_MAX 4294967295U
 #endif
 
+
 #ifdef USE_SSE
+#pragma message("LIBSPEEXDSP USES SSE!!!!")
 #include "resample_sse.h"
 #endif
 
 #ifdef USE_NEON
+#pragma message("LIBSPEEXDSP USES NEON!!!!")
 #include "resample_neon.h"
 #endif
 
