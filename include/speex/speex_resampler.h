@@ -54,6 +54,8 @@
 #define CAT_PREFIX2(a,b) a ## b
 #define CAT_PREFIX(a,b) CAT_PREFIX2(a, b)
 
+#define speex_resampler_init_cache CAT_PREFIX(RANDOM_PREFIX,_resampler_init_cache)
+#define speex_resampler_get_cache_misses CAT_PREFIX(RANDOM_PREFIX,_resampler_get_cache_misses)
 #define speex_resampler_init CAT_PREFIX(RANDOM_PREFIX,_resampler_init)
 #define speex_resampler_init_frac CAT_PREFIX(RANDOM_PREFIX,_resampler_init_frac)
 #define speex_resampler_destroy CAT_PREFIX(RANDOM_PREFIX,_resampler_destroy)
@@ -99,6 +101,10 @@ extern "C" {
 #define SPEEX_RESAMPLER_QUALITY_DEFAULT 4
 #define SPEEX_RESAMPLER_QUALITY_VOIP 3
 #define SPEEX_RESAMPLER_QUALITY_DESKTOP 5
+
+// factor for memory reallocation to prevent reallocations
+// @LUTAL
+#define SPEEX_MIN_ALLOCATION_SIZE 16384
 
 enum {
    RESAMPLER_ERR_SUCCESS         = 0,
@@ -154,6 +160,22 @@ SpeexResamplerState *speex_resampler_init_frac(spx_uint32_t nb_channels,
  * @param st Resampler state
  */
 void speex_resampler_destroy(SpeexResamplerState *st);
+
+/**
+ * LUTAL:
+ * Create cache which prevents internal recalculations when set_rate is called 
+ * several times with equal in/out rates.
+ * max_size_entries specifies the number of n last ratios which will be stored
+ * and then can be recalled quickly.
+ * Unless specifc use case please ude SPEEX_MIN_ALLOCATION_SIZE for max_entry_size
+ */
+int speex_resampler_init_cache(SpeexResamplerState*, spx_uint32_t entries, spx_uint32_t max_entry_size);
+
+/**
+ * Retrieve the number of cache occurred misses.
+ * zero if cach is not initialized (speex_resampler_init_cache) 
+ */
+spx_uint32_t speex_resampler_get_cache_misses(SpeexResamplerState*);
 
 /** Resample a float array. The input and output buffers must *not* overlap.
  * @param st Resampler state

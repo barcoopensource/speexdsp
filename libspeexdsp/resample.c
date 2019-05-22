@@ -116,11 +116,24 @@ static void speex_free(void *ptr) {free(ptr);}
 
 #include <stdint.h>
 
-// factor for memory reallocation to prevent reallocations
-// @LUTAL
-#define MIN_ALLOCATION_SIZE 16384
-
 typedef int (*resampler_basic_func)(SpeexResamplerState *, spx_uint32_t , const spx_word16_t *, spx_uint32_t *, spx_word16_t *, spx_uint32_t *);
+
+/// Sinc-Table Cache Structure
+struct CachedSyncTableInfo
+{
+  int active;
+  spx_uint32_t num_rate;
+  spx_uint32_t den_rate;
+  int    quality;
+
+  spx_uint32_t oversample;
+  spx_uint32_t filt_len;
+  
+  resampler_basic_func resampler_ptr;
+  
+  spx_uint32_t sinc_table_length;
+  spx_word16_t* cached_data;
+};
 
 struct SpeexResamplerState_ {
    spx_uint32_t in_rate;
@@ -152,7 +165,128 @@ struct SpeexResamplerState_ {
 
    int    in_stride;
    int    out_stride;
+   
+    // caching stuff
+   struct CachedSyncTableInfo *cached_sync_table_infos;
+   spx_uint32_t cached_sync_table_element_size;
+   spx_uint32_t cached_sync_table_infos_num;   
+   spx_uint32_t cached_sync_table_write_index;
+   
+   // temporary values for caching mechanism
+   spx_uint32_t old_num_rate;
+   spx_uint32_t old_den_rate;
+   int    old_quality;
+   
+   // cache misses counter
+   spx_uint32_t cache_misses;
 } ;
+
+void cache_sync_table(SpeexResamplerState *st)
+{
+  if (!st->cached_sync_table_infos)
+  {
+    return;
+  }
+  
+  if(st->cached_sync_table_element_size < st->sinc_table_length)
+  {
+    // cache size too small (we count that also as a cache miss)
+    st->cache_misses++;
+    return;
+  }
+
+  struct CachedSyncTableInfo* cache = &st->cached_sync_table_infos[st->cached_sync_table_write_index];
+  
+  cache->active = 1;
+  cache->num_rate = st->num_rate;
+  cache->den_rate = st->den_rate;
+  cache->filt_len = st->filt_len;
+  cache->quality  = st->quality;
+  cache->oversample = st->oversample;
+  cache->resampler_ptr = st->resampler_ptr;
+  memcpy(cache->cached_data, st->sinc_table, st->sinc_table_length * sizeof(spx_word16_t));
+  cache->sinc_table_length = st->sinc_table_length;
+  
+  // advance write pointer
+  st->cached_sync_table_write_index = (st->cached_sync_table_write_index + 1) % st->cached_sync_table_infos_num;
+}
+
+int fetch_cached_sync_table(SpeexResamplerState *st)
+{
+  int i, j;  
+
+  if (!st->cached_sync_table_infos || !st->cached_sync_table_infos_num)
+  {
+    return 0;
+  }
+
+  j = st->cached_sync_table_write_index;
+
+  for (i = 0; i < st->cached_sync_table_infos_num; i++)
+  {
+    // search backwards
+    if (j == 0)
+    {
+      j = st->cached_sync_table_infos_num - 1;
+    }
+    else
+    {
+      j--;
+    }
+
+    struct CachedSyncTableInfo* cache = &st->cached_sync_table_infos[j];
+    if (cache->active == 1 &&
+        cache->num_rate == st->num_rate &&
+        cache->den_rate == st->den_rate &&
+        cache->quality  == st->quality)
+    {
+      // SWAP the cached entry with the actual entry   
+     
+      // these 3 value are already changed
+      // so we use these variables which still hold the
+      // old states
+      cache->num_rate = st->old_num_rate;
+      cache->den_rate = st->old_den_rate;
+      cache->quality = st->old_quality;
+      st->old_num_rate = st->num_rate;
+      st->old_den_rate = st->den_rate;
+      st->old_quality = st->quality;
+      
+      spx_uint32_t tmp;
+      
+      tmp = st->oversample;
+      st->oversample = cache->oversample;
+      cache->oversample = tmp;
+      
+      tmp = st->filt_len;
+      st->filt_len = cache->filt_len;
+      cache->filt_len = tmp;
+      
+      resampler_basic_func tmpPtr;
+      tmpPtr = st->resampler_ptr;
+      st->resampler_ptr = cache->resampler_ptr;
+      cache->resampler_ptr = tmpPtr;
+      
+      tmp = st->sinc_table_length;
+      st->sinc_table_length = cache->sinc_table_length;
+      cache->sinc_table_length = tmp;
+      
+      spx_word16_t* tmpPtr2;
+      tmpPtr2 = st->sinc_table;
+      
+      st->sinc_table = cache->cached_data;
+      cache->cached_data = tmpPtr2;
+
+      return 1;
+    }
+
+  }
+
+  st->cache_misses++;
+  
+  // cache miss
+  return 0;
+}
 
 static const double kaiser12_table[68] = {
    0.99859849, 1.00000000, 0.99859849, 0.99440475, 0.98745105, 0.97779076,
@@ -633,99 +767,104 @@ static int update_filter(SpeexResamplerState *st)
 
    st->int_advance = st->num_rate/st->den_rate;
    st->frac_advance = st->num_rate%st->den_rate;
-   st->oversample = quality_map[st->quality].oversample;
-   st->filt_len = quality_map[st->quality].base_length;
-
-   if (st->num_rate > st->den_rate)
+   
+   if (!fetch_cached_sync_table(st))
    {
-      /* down-sampling */
-      st->cutoff = quality_map[st->quality].downsample_bandwidth * st->den_rate / st->num_rate;
-      if (multiply_frac(&st->filt_len,st->filt_len,st->num_rate,st->den_rate) != RESAMPLER_ERR_SUCCESS)
-         goto fail;
-      /* Round up to make sure we have a multiple of 8 for SSE */
-      st->filt_len = ((st->filt_len-1)&(~0x7))+8;
-      if (2*st->den_rate < st->num_rate)
-         st->oversample >>= 1;
-      if (4*st->den_rate < st->num_rate)
-         st->oversample >>= 1;
-      if (8*st->den_rate < st->num_rate)
-         st->oversample >>= 1;
-      if (16*st->den_rate < st->num_rate)
-         st->oversample >>= 1;
-      if (st->oversample < 1)
-         st->oversample = 1;
-   } else {
-      /* up-sampling */
-      st->cutoff = quality_map[st->quality].upsample_bandwidth;
-   }
+     st->oversample = quality_map[st->quality].oversample;
+     st->filt_len = quality_map[st->quality].base_length;
+
+     if (st->num_rate > st->den_rate)
+     {
+        /* down-sampling */
+        st->cutoff = quality_map[st->quality].downsample_bandwidth * st->den_rate / st->num_rate;
+        if (multiply_frac(&st->filt_len,st->filt_len,st->num_rate,st->den_rate) != RESAMPLER_ERR_SUCCESS)
+           goto fail;
+        /* Round up to make sure we have a multiple of 8 for SSE */
+        st->filt_len = ((st->filt_len-1)&(~0x7))+8;
+        if (2*st->den_rate < st->num_rate)
+           st->oversample >>= 1;
+        if (4*st->den_rate < st->num_rate)
+           st->oversample >>= 1;
+        if (8*st->den_rate < st->num_rate)
+           st->oversample >>= 1;
+        if (16*st->den_rate < st->num_rate)
+           st->oversample >>= 1;
+        if (st->oversample < 1)
+           st->oversample = 1;
+     } else {
+        /* up-sampling */
+        st->cutoff = quality_map[st->quality].upsample_bandwidth;
+     }
 
 #ifdef RESAMPLE_FULL_SINC_TABLE
-   use_direct = 1;
-   if (INT_MAX/sizeof(spx_word16_t)/st->den_rate < st->filt_len)
-      goto fail;
+     use_direct = 1;
+     if (INT_MAX/sizeof(spx_word16_t)/st->den_rate < st->filt_len)
+        goto fail;
 #else
-   /* Choose the resampling type that requires the least amount of memory */
-   use_direct = st->filt_len*st->den_rate <= st->filt_len*st->oversample+8
-                && INT_MAX/sizeof(spx_word16_t)/st->den_rate >= st->filt_len;
+     /* Choose the resampling type that requires the least amount of memory */
+     use_direct = st->filt_len*st->den_rate <= st->filt_len*st->oversample+8
+                  && INT_MAX/sizeof(spx_word16_t)/st->den_rate >= st->filt_len;
 #endif
-   if (use_direct)
-   {
-      min_sinc_table_length = st->filt_len*st->den_rate;
-   } else {
-      if ((INT_MAX/sizeof(spx_word16_t)-8)/st->oversample < st->filt_len)
-         goto fail;
+     if (use_direct)
+     {
+        min_sinc_table_length = st->filt_len*st->den_rate;
+     } else {
+        if ((INT_MAX/sizeof(spx_word16_t)-8)/st->oversample < st->filt_len)
+           goto fail;
 
-      min_sinc_table_length = st->filt_len*st->oversample+8;
-   }
-   if (st->sinc_table_length < min_sinc_table_length)
-   {
-      if(min_sinc_table_length < MIN_ALLOCATION_SIZE)
-      {
-        min_sinc_table_length = MIN_ALLOCATION_SIZE;
-      }     
+        min_sinc_table_length = st->filt_len*st->oversample+8;
+     }
+     if (st->sinc_table_length < min_sinc_table_length)
+     {
+        if(min_sinc_table_length < SPEEX_MIN_ALLOCATION_SIZE)
+        {
+          min_sinc_table_length = SPEEX_MIN_ALLOCATION_SIZE;
+        }     
 
-      spx_word16_t *sinc_table = (spx_word16_t *)speex_realloc(st->sinc_table,min_sinc_table_length*sizeof(spx_word16_t));
-      if (!sinc_table)
-         goto fail;
+        spx_word16_t *sinc_table = (spx_word16_t *)speex_realloc(st->sinc_table,min_sinc_table_length*sizeof(spx_word16_t));
+        if (!sinc_table)
+           goto fail;
 
-      st->sinc_table = sinc_table;
-      st->sinc_table_length = min_sinc_table_length;
-   }
-   if (use_direct)
-   {
-      spx_uint32_t i;
-      for (i=0;i<st->den_rate;i++)
-      {
-         spx_int32_t j;
-         for (j=0;j<st->filt_len;j++)
-         {
-            st->sinc_table[i*st->filt_len+j] = sinc(st->cutoff,((j-(spx_int32_t)st->filt_len/2+1)-((float)i)/st->den_rate), st->filt_len, quality_map[st->quality].window_func);
-         }
-      }
+        st->sinc_table = sinc_table;
+        st->sinc_table_length = min_sinc_table_length;
+     }
+     if (use_direct)
+     {
+        spx_uint32_t i;
+        for (i=0;i<st->den_rate;i++)
+        {
+           spx_int32_t j;
+           for (j=0;j<st->filt_len;j++)
+           {
+              st->sinc_table[i*st->filt_len+j] = sinc(st->cutoff,((j-(spx_int32_t)st->filt_len/2+1)-((float)i)/st->den_rate), st->filt_len, quality_map[st->quality].window_func);
+           }
+        }
 #ifdef FIXED_POINT
-      st->resampler_ptr = resampler_basic_direct_single;
+        st->resampler_ptr = resampler_basic_direct_single;
 #else
-      if (st->quality>8)
-         st->resampler_ptr = resampler_basic_direct_double;
-      else
-         st->resampler_ptr = resampler_basic_direct_single;
+        if (st->quality>8)
+           st->resampler_ptr = resampler_basic_direct_double;
+        else
+           st->resampler_ptr = resampler_basic_direct_single;
 #endif
-      /*fprintf (stderr, "resampler uses direct sinc table and normalised cutoff %f\n", cutoff);*/
-   } else {
-      spx_int32_t i;
-      for (i=-4;i<(spx_int32_t)(st->oversample*st->filt_len+4);i++)
-         st->sinc_table[i+4] = sinc(st->cutoff,(i/(float)st->oversample - st->filt_len/2), st->filt_len, quality_map[st->quality].window_func);
+        /*fprintf (stderr, "resampler uses direct sinc table and normalised cutoff %f\n", cutoff);*/
+     } else {
+        spx_int32_t i;
+        for (i=-4;i<(spx_int32_t)(st->oversample*st->filt_len+4);i++)
+           st->sinc_table[i+4] = sinc(st->cutoff,(i/(float)st->oversample - st->filt_len/2), st->filt_len, quality_map[st->quality].window_func);
 #ifdef FIXED_POINT
-      st->resampler_ptr = resampler_basic_interpolate_single;
+        st->resampler_ptr = resampler_basic_interpolate_single;
 #else
-      if (st->quality>8)
-         st->resampler_ptr = resampler_basic_interpolate_double;
-      else
-         st->resampler_ptr = resampler_basic_interpolate_single;
+        if (st->quality>8)
+           st->resampler_ptr = resampler_basic_interpolate_double;
+        else
+           st->resampler_ptr = resampler_basic_interpolate_single;
 #endif
-      /*fprintf (stderr, "resampler uses interpolated sinc table and normalised cutoff %f\n", cutoff);*/
+        /*fprintf (stderr, "resampler uses interpolated sinc table and normalised cutoff %f\n", cutoff);*/
+     }
+     
+     cache_sync_table(st);
    }
-
    /* Here's the place where we update the filter memory to take into account
       the change in filter length. It's probably the messiest part of the code
       due to handling of lots of corner cases. */
@@ -735,9 +874,9 @@ static int update_filter(SpeexResamplerState *st)
    min_alloc_size = st->filt_len-1 + st->buffer_size;
    if (min_alloc_size > st->mem_alloc_size)
    {
-      if (min_alloc_size < MIN_ALLOCATION_SIZE)
+      if (min_alloc_size < SPEEX_MIN_ALLOCATION_SIZE)
       {
-        min_alloc_size = MIN_ALLOCATION_SIZE;
+        min_alloc_size = SPEEX_MIN_ALLOCATION_SIZE;
       }
       
       spx_word16_t *mem;
@@ -864,7 +1003,14 @@ EXPORT SpeexResamplerState *speex_resampler_init_frac(spx_uint32_t nb_channels, 
    st->out_stride = 1;
 
    st->buffer_size = 160;
-
+   
+   st->cached_sync_table_infos_num = 0;
+   st->cached_sync_table_infos = 0;
+   st->old_num_rate = 0;
+   st->old_den_rate = 0;
+   st->old_quality = -1;
+   st->cache_misses = 0;
+   
    /* Per channel data */
    if (!(st->last_sample = (spx_int32_t*)speex_alloc(nb_channels*sizeof(spx_int32_t))))
       goto fail;
@@ -896,6 +1042,56 @@ fail:
    return NULL;
 }
 
+void destroy_cache(SpeexResamplerState* state)
+{
+  int i;
+  if(state->cached_sync_table_infos)
+  {
+    for (i = 0; i < state->cached_sync_table_infos_num; i++)
+    {  
+      struct CachedSyncTableInfo*  cache = &state->cached_sync_table_infos[i];
+      speex_free(cache->cached_data);
+    }
+  
+   speex_free(state->cached_sync_table_infos);   
+  }
+}
+
+EXPORT int speex_resampler_init_cache(SpeexResamplerState* state, spx_uint32_t entries, spx_uint32_t max_entry_size)
+{
+  int i;
+  destroy_cache(state);
+  
+  state->cached_sync_table_infos = (struct CachedSyncTableInfo*)speex_alloc(entries*sizeof(struct CachedSyncTableInfo));
+  if (!state->cached_sync_table_infos)
+  {
+    return RESAMPLER_ERR_ALLOC_FAILED;
+  }
+   
+  for (i = 0; i < entries; i++)
+  {
+    struct CachedSyncTableInfo*  cache = &state->cached_sync_table_infos[i];
+    cache->active = 0;    
+    cache->cached_data = (spx_word16_t *)speex_alloc(max_entry_size*sizeof(spx_word16_t));
+    if (!cache->cached_data)
+    {
+      return RESAMPLER_ERR_ALLOC_FAILED;
+    }
+  }
+  
+  state->cached_sync_table_write_index = 0;
+  state->cached_sync_table_infos_num = entries;
+  
+  state->cached_sync_table_element_size = max_entry_size;
+  state->cache_misses = 0;
+  return RESAMPLER_ERR_SUCCESS;
+}
+
+EXPORT int speex_resampler_get_cache_misses(SpeexResamplerState* state)
+{
+  return state->cache_misses;
+}
+
 EXPORT void speex_resampler_destroy(SpeexResamplerState *st)
 {
    speex_free(st->mem);
@@ -903,6 +1099,8 @@ EXPORT void speex_resampler_destroy(SpeexResamplerState *st)
    speex_free(st->last_sample);
    speex_free(st->magic_samples);
    speex_free(st->samp_frac_num);
+   
+   destroy_cache(st);
    speex_free(st);
 }
 
@@ -1140,7 +1338,11 @@ EXPORT int speex_resampler_set_rate_frac(SpeexResamplerState *st, spx_uint32_t r
    spx_uint32_t fact;
    spx_uint32_t old_den;
    spx_uint32_t i;
-
+   
+   st->old_num_rate = st->num_rate;
+   st->old_den_rate = st->den_rate;
+   st->old_quality = st->quality;
+   
    if (ratio_num == 0 || ratio_den == 0)
       return RESAMPLER_ERR_INVALID_ARG;
 
@@ -1187,6 +1389,11 @@ EXPORT int speex_resampler_set_quality(SpeexResamplerState *st, int quality)
       return RESAMPLER_ERR_INVALID_ARG;
    if (st->quality == quality)
       return RESAMPLER_ERR_SUCCESS;
+    
+   st->old_num_rate = st->num_rate;
+   st->old_den_rate = st->den_rate;
+   st->old_quality = st->quality;
+   
    st->quality = quality;
    if (st->initialised)
       return update_filter(st);
