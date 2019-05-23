@@ -1087,7 +1087,7 @@ EXPORT int speex_resampler_init_cache(SpeexResamplerState* state, spx_uint32_t e
   return RESAMPLER_ERR_SUCCESS;
 }
 
-EXPORT int speex_resampler_get_cache_misses(SpeexResamplerState* state)
+EXPORT spx_uint32_t speex_resampler_get_cache_misses(SpeexResamplerState* state)
 {
   return state->cache_misses;
 }
